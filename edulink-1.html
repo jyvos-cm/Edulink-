@@ -1,0 +1,1035 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="theme-color" content="#0A1628">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>EduLink</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import {
+  getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+  onAuthStateChanged, signOut, updateProfile
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import {
+  getFirestore, doc, setDoc, getDoc, collection, addDoc,
+  query, orderBy, onSnapshot, updateDoc, increment,
+  arrayUnion, arrayRemove, serverTimestamp, limit, where, getDocs
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCblbhd4jCR3YJIcaTnWdSmLrCr7AQkxaU",
+  authDomain: "edulink-cm.firebaseapp.com",
+  projectId: "edulink-cm",
+  storageBucket: "edulink-cm.firebasestorage.app",
+  messagingSenderId: "1030851030743",
+  appId: "1:1030851030743:web:8378f81fe59fa5de774a92"
+};
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
+
+const CLD_IMG = 'https://api.cloudinary.com/v1_1/doruo75nh/image/upload';
+const CLD_RAW = 'https://api.cloudinary.com/v1_1/doruo75nh/raw/upload';
+const CLD_PRE = 'ml_default';
+
+let currentUser = null;
+let unsubPosts = null, unsubMsgs = null, unsubGroup = null;
+let activeConvId = null, activeGroupId = null;
+
+// ══════════════ AUTH STATE ══════════════
+onAuthStateChanged(auth, async user => {
+  if(user) {
+    const snap = await getDoc(doc(db,'users',user.uid));
+    if(snap.exists()) {
+      currentUser = {uid:user.uid,...snap.data()};
+      updateUI();
+      showScreen('dashboard');
+      loadConversations();
+    } else showScreen('login');
+  } else {
+    currentUser = null;
+    showScreen('login');
+  }
+});
+
+function updateUI() {
+  const ini = currentUser.prenom?.[0]?.toUpperCase()||'?';
+  setText('dash-name', `Bonjour ${currentUser.prenom} 👋`);
+  setText('dash-info', `${currentUser.classe} — ${currentUser.ville}`);
+  setText('post-avatar-letter', ini);
+  setText('notif-count', '0');
+  if(currentUser.photoURL) refreshPhotos(currentUser.photoURL);
+}
+
+function setText(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
+
+function refreshPhotos(url) {
+  ['post-avatar-img','profil-photo-img'].forEach(id=>{
+    const e=document.getElementById(id);
+    if(e){e.src=url;e.style.display='block';}
+  });
+  ['post-avatar-letter','profil-avatar-letter'].forEach(id=>{
+    const e=document.getElementById(id);
+    if(e)e.style.display='none';
+  });
+}
+
+// ══════════════ INSCRIPTION ══════════════
+window.handleRegister = async e => {
+  e.preventDefault();
+  const btn=document.getElementById('btn-register');
+  const prenom=v('r-prenom'),nom=v('r-nom'),email=v('r-email'),
+        password=v('r-password'),confirm=v('r-confirm'),
+        classe=v('r-classe'),ville=v('r-ville'),age=parseInt(v('r-age'));
+
+  if(password!==confirm) return showErr('Mots de passe différents.');
+  if(password.length<8)  return showErr('Minimum 8 caractères.');
+  if(!classe)             return showErr('Sélectionne ta classe.');
+  if(age<13)              return showErr('Minimum 13 ans.');
+
+  setBtn(btn,true);
+  try {
+    const cred=await createUserWithEmailAndPassword(auth,email,password);
+    await updateProfile(cred.user,{displayName:`${prenom} ${nom}`});
+    await setDoc(doc(db,'users',cred.user.uid),{
+      uid:cred.user.uid,nom,prenom,displayName:`${prenom} ${nom}`,
+      email,classe,ville,age,role:'eleve',premium:false,
+      xp:0,badges:[],active:true,photoURL:null,
+      createdAt:serverTimestamp(),lastSeen:serverTimestamp()
+    });
+    showOk('Compte créé ! Bienvenue 🎓');
+  } catch(err){ showErr(fbErr(err.code)); }
+  setBtn(btn,false);
+};
+
+// ══════════════ CONNEXION ══════════════
+window.handleLogin = async e => {
+  e.preventDefault();
+  const btn=document.getElementById('btn-login');
+  setBtn(btn,true);
+  try {
+    await signInWithEmailAndPassword(auth,v('l-email'),v('l-password'));
+  } catch(err){ showErr(fbErr(err.code)); }
+  setBtn(btn,false);
+};
+
+window.handleLogout = async () => {
+  [unsubPosts,unsubMsgs,unsubGroup].forEach(u=>u&&u());
+  await signOut(auth);
+};
+
+// ══════════════ PHOTO PROFIL ══════════════
+window.uploadAvatar = async file => {
+  if(!file||!currentUser) return;
+  if(file.size>3*1024*1024) return showErr('Max 3MB.');
+  showOk('Upload...');
+  try {
+    const fd=new FormData();
+    fd.append('file',file);fd.append('upload_preset',CLD_PRE);
+    const res=await fetch(CLD_IMG,{method:'POST',body:fd});
+    const data=await res.json();
+    if(data.error) throw new Error(data.error.message);
+    await updateDoc(doc(db,'users',currentUser.uid),{photoURL:data.secure_url});
+    currentUser.photoURL=data.secure_url;
+    refreshPhotos(data.secure_url);
+    showOk('Photo mise à jour ✅');
+  } catch(e){ showErr('Erreur upload.'); }
+};
+
+// ══════════════ FIL D'ACTUALITÉ ══════════════
+window.handlePost = async e => {
+  e.preventDefault();
+  const btn=document.getElementById('btn-publish');
+  const content=v('post-content').trim();
+  const categorie=v('post-categorie');
+  if(!content) return showErr('Écris quelque chose !');
+  if(!currentUser) return showErr('Connecte-toi.');
+  setBtn(btn,true);
+  try {
+    await addDoc(collection(db,'posts'),{
+      content,categorie,
+      authorUid:currentUser.uid,authorName:currentUser.displayName,
+      authorPrenom:currentUser.prenom,authorClasse:currentUser.classe,
+      authorVille:currentUser.ville,authorPhoto:currentUser.photoURL||null,
+      likes:[],likesCount:0,commentsCount:0,
+      createdAt:serverTimestamp()
+    });
+    document.getElementById('post-content').value='';
+    setText('char-count','0/1000');
+    showOk('Publié ! 🎉');
+    // XP +5 pour post
+    await updateDoc(doc(db,'users',currentUser.uid),{xp:increment(5)});
+    currentUser.xp=(currentUser.xp||0)+5;
+  } catch(e){ showErr('Erreur publication.'); }
+  setBtn(btn,false);
+};
+
+window.loadFil = () => {
+  if(unsubPosts) unsubPosts();
+  const q=query(collection(db,'posts'),orderBy('createdAt','desc'),limit(30));
+  unsubPosts=onSnapshot(q,snap=>{
+    const box=document.getElementById('posts-container');
+    if(snap.empty){
+      box.innerHTML=`<div class="empty-state"><div style="font-size:3rem">📝</div><p>Aucun post.<br>Sois le premier !</p></div>`;
+      return;
+    }
+    box.innerHTML='';
+    snap.forEach(d=>{
+      const p=d.data(),pid=d.id;
+      const liked=p.likes?.includes(currentUser?.uid);
+      const av=p.authorPrenom?.[0]?.toUpperCase()||'?';
+      const catC={cours:'#3498db',question:'#e67e22',annonce:'#e74c3c',detente:'#2ecc71'};
+      const catL={cours:'📚 Cours',question:'❓ Question',annonce:'📢 Annonce',detente:'😄 Détente',general:'💬 Général'};
+      const el=document.createElement('div');
+      el.className='post-card';
+      el.innerHTML=`
+        <div class="post-header">
+          <div class="post-avatar">${p.authorPhoto?`<img src="${p.authorPhoto}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`:av}</div>
+          <div class="post-meta">
+            <div class="post-author">${p.authorName||'Élève'}</div>
+            <div class="post-info">${p.authorClasse||''} · ${p.authorVille||''} · ${timeAgo(p.createdAt?.toDate())}</div>
+          </div>
+          ${p.categorie&&p.categorie!=='general'?`<span class="post-cat" style="background:${catC[p.categorie]||'#666'}22;color:${catC[p.categorie]||'#aaa'}">${catL[p.categorie]||p.categorie}</span>`:''}
+        </div>
+        <div class="post-content">${esc(p.content)}</div>
+        <div class="post-actions">
+          <button class="action-btn${liked?' liked':''}" onclick="toggleLike('${pid}',${liked})">
+            ${liked?'❤️':'🤍'} ${p.likesCount||0}
+          </button>
+          <button class="action-btn" onclick="toggleComments('${pid}')">💬 ${p.commentsCount||0}</button>
+          <button class="action-btn" onclick="startDM('${p.authorUid}','${p.authorName}','${av}')">✉️ MP</button>
+        </div>
+        <div class="comments-section" id="cs-${pid}" style="display:none">
+          <div id="cl-${pid}"></div>
+          <div class="comment-form">
+            <input type="text" id="ci-${pid}" placeholder="Commentaire..." maxlength="300">
+            <button onclick="addComment('${pid}')">➤</button>
+          </div>
+        </div>`;
+      box.appendChild(el);
+    });
+  },err=>{ console.error(err); });
+};
+
+window.toggleLike = async(pid,liked)=>{
+  if(!currentUser)return;
+  const ref=doc(db,'posts',pid);
+  if(liked) await updateDoc(ref,{likes:arrayRemove(currentUser.uid),likesCount:increment(-1)});
+  else {
+    await updateDoc(ref,{likes:arrayUnion(currentUser.uid),likesCount:increment(1)});
+    await updateDoc(doc(db,'users',currentUser.uid),{xp:increment(1)});
+  }
+};
+
+window.toggleComments = async pid=>{
+  const s=document.getElementById(`cs-${pid}`);
+  const open=s.style.display!=='none';
+  s.style.display=open?'none':'block';
+  if(!open) loadComments(pid);
+};
+
+async function loadComments(pid){
+  const q=query(collection(db,'posts',pid,'comments'),orderBy('createdAt','asc'),limit(20));
+  onSnapshot(q,snap=>{
+    const list=document.getElementById(`cl-${pid}`);
+    if(!list)return;
+    list.innerHTML='';
+    snap.forEach(d=>{
+      const c=d.data();
+      const div=document.createElement('div');
+      div.className='comment-item';
+      div.innerHTML=`<div class="comment-avatar">${c.authorPrenom?.[0]?.toUpperCase()||'?'}</div>
+        <div><div class="comment-author">${c.authorName}</div><div class="comment-text">${esc(c.content)}</div></div>`;
+      list.appendChild(div);
+    });
+  });
+}
+
+window.addComment = async pid=>{
+  if(!currentUser)return;
+  const inp=document.getElementById(`ci-${pid}`);
+  const content=inp.value.trim();
+  if(!content)return;
+  await addDoc(collection(db,'posts',pid,'comments'),{
+    content,authorUid:currentUser.uid,authorName:currentUser.displayName,
+    authorPrenom:currentUser.prenom,createdAt:serverTimestamp()
+  });
+  await updateDoc(doc(db,'posts',pid),{commentsCount:increment(1)});
+  await updateDoc(doc(db,'users',currentUser.uid),{xp:increment(2)});
+  inp.value='';
+};
+
+// ══════════════ COURS PDF ══════════════
+window.uploadCours = async()=>{
+  if(!currentUser)return;
+  const titre=v('cours-titre'),matiere=v('cours-matiere'),
+        classe=v('cours-classe'),desc=v('cours-desc');
+  const file=document.getElementById('cours-file').files[0];
+  if(!titre)   return showErr('Titre requis.');
+  if(!matiere) return showErr('Matière requise.');
+  if(!classe)  return showErr('Classe requise.');
+  if(!file)    return showErr('Sélectionne un fichier.');
+  if(file.size>10*1024*1024) return showErr('Max 10MB.');
+
+  const btn=document.getElementById('btn-upload-cours');
+  setBtn(btn,true);
+  try {
+    const fd=new FormData();
+    fd.append('file',file);fd.append('upload_preset',CLD_PRE);
+    const isPdf=file.type==='application/pdf';
+    const res=await fetch(isPdf?CLD_RAW:CLD_IMG,{method:'POST',body:fd});
+    const data=await res.json();
+    if(data.error) throw new Error(data.error.message);
+    await addDoc(collection(db,'cours'),{
+      titre,matiere,classe,desc,
+      fileUrl:data.secure_url,fileType:isPdf?'pdf':'image',
+      fileName:file.name,fileSize:Math.round(file.size/1024)+' KB',
+      authorUid:currentUser.uid,authorName:currentUser.displayName,
+      authorClasse:currentUser.classe,telecharges:0,likes:[],likesCount:0,
+      createdAt:serverTimestamp()
+    });
+    // Reset
+    ['cours-titre','cours-desc'].forEach(id=>{const e=document.getElementById(id);if(e)e.value='';});
+    document.getElementById('cours-file').value='';
+    setText('file-name-display','Aucun fichier');
+    document.getElementById('cours-form').style.display='none';
+    await updateDoc(doc(db,'users',currentUser.uid),{xp:increment(10)});
+    showOk('Cours publié ! 📚 +10 XP');
+    loadCours();
+  } catch(e){ showErr('Erreur upload.'); console.error(e); }
+  setBtn(btn,false);
+};
+
+window.loadCours = async(filtreM='',filtreC='')=>{
+  const box=document.getElementById('cours-container');
+  box.innerHTML='<div class="empty-state"><p>⏳ Chargement...</p></div>';
+  try {
+    const snap=await getDocs(query(collection(db,'cours'),orderBy('createdAt','desc'),limit(40)));
+    if(snap.empty){
+      box.innerHTML=`<div class="empty-state"><div style="font-size:3rem">📚</div><p>Aucun cours partagé.<br>Sois le premier !</p></div>`;
+      return;
+    }
+    box.innerHTML='';
+    const mC={maths:'#3498db',francais:'#e74c3c',anglais:'#27ae60',svt:'#2ecc71',physique:'#9b59b6',histoire:'#f39c12',info:'#1abc9c',autre:'#95a5a6'};
+    snap.forEach(d=>{
+      const c=d.data(),cid=d.id;
+      if(filtreM&&c.matiere!==filtreM)return;
+      if(filtreC&&c.classe!==filtreC)return;
+      const liked=c.likes?.includes(currentUser?.uid);
+      const col=mC[c.matiere]||'#95a5a6';
+      const el=document.createElement('div');
+      el.className='cours-card';
+      el.innerHTML=`
+        <div class="cours-header">
+          <div class="cours-icon" style="background:${col}22;color:${col}">${c.fileType==='pdf'?'📄':'🖼️'}</div>
+          <div class="cours-meta">
+            <div class="cours-titre">${esc(c.titre)}</div>
+            <div class="cours-info">${c.matiere} · ${c.classe} · par ${c.authorName}</div>
+          </div>
+          <div class="cours-size">${c.fileSize||''}</div>
+        </div>
+        ${c.desc?`<div class="cours-desc">${esc(c.desc)}</div>`:''}
+        <div class="cours-actions">
+          <a href="${c.fileUrl}" target="_blank" class="btn-dl" onclick="countDl('${cid}')">⬇️ Télécharger</a>
+          <button class="action-btn${liked?' liked':''}" onclick="likeCours('${cid}',${liked})">
+            ${liked?'❤️':'🤍'} ${c.likesCount||0}
+          </button>
+          <span style="font-size:.75rem;color:var(--gray)">📥 ${c.telecharges||0}</span>
+        </div>`;
+      box.appendChild(el);
+    });
+  } catch(e){ box.innerHTML='<div class="empty-state"><p>❌ Erreur.</p></div>'; console.error(e); }
+};
+
+window.likeCours  = async(id,liked)=>{ if(!currentUser)return; const ref=doc(db,'cours',id); if(liked) await updateDoc(ref,{likes:arrayRemove(currentUser.uid),likesCount:increment(-1)}); else await updateDoc(ref,{likes:arrayUnion(currentUser.uid),likesCount:increment(1)}); loadCours(); };
+window.countDl    = async id=>{ await updateDoc(doc(db,'cours',id),{telecharges:increment(1)}); };
+window.toggleCoursForm = ()=>{ const f=document.getElementById('cours-form'); f.style.display=f.style.display==='none'?'block':'none'; };
+window.updateFileName = input=>{ setText('file-name-display',input.files[0]?.name||'Aucun fichier'); };
+window.filterCours = (btn,m,c)=>{ document.querySelectorAll('.cours-filter').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); loadCours(m,c); };
+
+// ══════════════ CLASSEMENT XP ══════════════
+window.loadClassement = async()=>{
+  const box=document.getElementById('classement-container');
+  box.innerHTML='<div class="empty-state"><p>⏳ Chargement...</p></div>';
+  try {
+    const snap=await getDocs(query(collection(db,'users'),orderBy('xp','desc'),limit(20)));
+    if(snap.empty){ box.innerHTML='<div class="empty-state"><p>Aucun élève.</p></div>'; return; }
+    box.innerHTML='';
+    const medals=['🥇','🥈','🥉'];
+    let rank=0;
+    snap.forEach(d=>{
+      const u=d.data();
+      rank++;
+      const isMe=u.uid===currentUser?.uid;
+      const el=document.createElement('div');
+      el.className=`rank-item${isMe?' rank-me':''}`;
+      el.innerHTML=`
+        <div class="rank-pos">${medals[rank-1]||rank}</div>
+        <div class="rank-avatar">${u.prenom?.[0]?.toUpperCase()||'?'}</div>
+        <div class="rank-info">
+          <div class="rank-name">${u.displayName||'Élève'}${isMe?' <span style="color:var(--gold);font-size:.7rem">(moi)</span>':''}</div>
+          <div class="rank-sub">${u.classe||''} · ${u.ville||''}</div>
+        </div>
+        <div class="rank-xp">
+          <div class="rank-xp-num">${u.xp||0}</div>
+          <div style="font-size:.65rem;color:var(--gray)">XP</div>
+        </div>`;
+      box.appendChild(el);
+    });
+  } catch(e){ box.innerHTML='<div class="empty-state"><p>❌ Erreur.</p></div>'; }
+};
+
+// ══════════════ MESSAGERIE PRIVÉE ══════════════
+window.startDM = async(targetUid,targetName,targetAv)=>{
+  if(!currentUser||targetUid===currentUser.uid) return;
+  const ids=[currentUser.uid,targetUid].sort();
+  const convId=ids.join('_');
+  activeConvId=convId;
+  const ref=doc(db,'conversations',convId);
+  const snap=await getDoc(ref);
+  if(!snap.exists()) await setDoc(ref,{
+    participants:ids,
+    participantNames:{[currentUser.uid]:currentUser.displayName,[targetUid]:targetName},
+    createdAt:serverTimestamp(),lastMessage:'',lastMessageAt:serverTimestamp()
+  });
+  setText('chat-title',targetName);
+  setText('chat-avatar',targetAv);
+  document.getElementById('msgs-container').innerHTML='';
+  showPanel('msgs-panel');
+  if(unsubMsgs) unsubMsgs();
+  const q=query(collection(db,'conversations',convId,'messages'),orderBy('createdAt','asc'),limit(60));
+  unsubMsgs=onSnapshot(q,snap=>{
+    const box=document.getElementById('msgs-container');
+    box.innerHTML='';
+    snap.forEach(d=>{
+      const m=d.data(),mine=m.senderUid===currentUser.uid;
+      const div=document.createElement('div');
+      div.className=`msg-bubble ${mine?'msg-mine':'msg-other'}`;
+      div.textContent=m.text||'';
+      box.appendChild(div);
+    });
+    box.scrollTop=box.scrollHeight;
+  });
+};
+
+window.sendDM = async()=>{
+  if(!activeConvId||!currentUser)return;
+  const inp=document.getElementById('dm-input');
+  const text=inp.value.trim();
+  if(!text)return;
+  inp.value='';
+  await addDoc(collection(db,'conversations',activeConvId,'messages'),{
+    text,senderUid:currentUser.uid,senderName:currentUser.displayName,createdAt:serverTimestamp()
+  });
+  await updateDoc(doc(db,'conversations',activeConvId),{lastMessage:text,lastMessageAt:serverTimestamp()});
+};
+
+function loadConversations(){
+  if(!currentUser)return;
+  const q=query(collection(db,'conversations'),where('participants','array-contains',currentUser.uid),orderBy('lastMessageAt','desc'),limit(20));
+  onSnapshot(q,snap=>{
+    const box=document.getElementById('convs-list');
+    if(snap.empty){ box.innerHTML=`<div class="empty-state"><div style="font-size:2.5rem">💬</div><p>Aucune conversation.<br>Clique ✉️ MP dans le fil !</p></div>`; return; }
+    box.innerHTML='';
+    let notif=0;
+    snap.forEach(d=>{
+      const c=d.data();
+      const otherUid=c.participants.find(p=>p!==currentUser.uid);
+      const otherName=c.participantNames?.[otherUid]||'Élève';
+      const av=otherName[0]?.toUpperCase()||'?';
+      if(c.unread&&c.unread[currentUser.uid]) notif++;
+      const div=document.createElement('div');
+      div.className='conv-item';
+      div.innerHTML=`<div class="conv-avatar">${av}</div><div class="conv-info"><div class="conv-name">${otherName}</div><div class="conv-last">${c.lastMessage||'Nouvelle conversation'}</div></div>`;
+      div.onclick=()=>startDM(otherUid,otherName,av);
+      box.appendChild(div);
+    });
+    if(notif>0){ const nb=document.getElementById('notif-count'); if(nb){nb.textContent=notif;nb.style.display='flex';} }
+  });
+}
+
+// ══════════════ GROUPES ══════════════
+window.loadGroupes = async()=>{
+  if(!currentUser)return;
+  const box=document.getElementById('groupes-list');
+  box.innerHTML='<div class="empty-state"><p>⏳ Chargement...</p></div>';
+  const groupes=[
+    {id:`classe_${currentUser.classe}_${currentUser.ville}`.replace(/\W/g,'_'),nom:`${currentUser.classe} — ${currentUser.ville}`,icon:'🎓',color:'linear-gradient(135deg,#3498db,#2ecc71)'},
+    {id:`classe_${currentUser.classe}_national`.replace(/\W/g,'_'),nom:`${currentUser.classe} — Cameroun 🇨🇲`,icon:'🇨🇲',color:'linear-gradient(135deg,#27ae60,#f39c12)'},
+    {id:`ville_${currentUser.ville}`.replace(/\W/g,'_'),nom:`Élèves de ${currentUser.ville}`,icon:'📍',color:'linear-gradient(135deg,#9b59b6,#3498db)'}
+  ];
+  for(const g of groupes){
+    const ref=doc(db,'groupes',g.id);
+    const snap=await getDoc(ref);
+    if(!snap.exists()) await setDoc(ref,{id:g.id,nom:g.nom,icon:g.icon,classe:currentUser.classe,ville:currentUser.ville,membres:[currentUser.uid],membresCount:1,createdAt:serverTimestamp(),lastMessage:'',lastMessageAt:serverTimestamp()});
+    else if(!snap.data().membres?.includes(currentUser.uid)) await updateDoc(ref,{membres:arrayUnion(currentUser.uid),membresCount:increment(1)});
+  }
+  box.innerHTML='';
+  for(const g of groupes){
+    const snap=await getDoc(doc(db,'groupes',g.id));
+    const data=snap.data()||{};
+    const count=data.membresCount||data.membres?.length||1;
+    const div=document.createElement('div');
+    div.className='conv-item';
+    div.innerHTML=`<div class="conv-avatar" style="background:${g.color};font-size:1.1rem">${g.icon}</div><div class="conv-info"><div class="conv-name">${g.nom}</div><div class="conv-last">${count} membre${count>1?'s':''} · ${data.lastMessage||'Aucun message'}</div></div><div class="groupe-badge">${count}</div>`;
+    div.onclick=()=>openGroupe(g.id,g.nom,g.icon,g.color);
+    box.appendChild(div);
+  }
+};
+
+window.openGroupe = async(groupId,groupNom,icon='📚',color='linear-gradient(135deg,#3498db,#2ecc71)')=>{
+  activeGroupId=groupId;
+  setText('group-title',groupNom);
+  const gav=document.getElementById('group-avatar');
+  if(gav){gav.textContent=icon;gav.style.background=color;}
+  document.getElementById('group-msgs').innerHTML='';
+  showPanel('group-panel');
+  if(unsubGroup) unsubGroup();
+  const q=query(collection(db,'groupes',groupId,'messages'),orderBy('createdAt','asc'),limit(100));
+  unsubGroup=onSnapshot(q,snap=>{
+    const box=document.getElementById('group-msgs');
+    box.innerHTML='';
+    snap.forEach(d=>{
+      const m=d.data(),mine=m.senderUid===currentUser.uid;
+      const div=document.createElement('div');
+      div.className=`msg-bubble ${mine?'msg-mine':'msg-other'}`;
+      if(!mine) div.innerHTML=`<div class="msg-sender">${m.senderName||'Élève'}</div>`;
+      div.innerHTML+=`<span>${esc(m.text||'')}</span>`;
+      box.appendChild(div);
+    });
+    box.scrollTop=box.scrollHeight;
+  });
+};
+
+window.sendGroupMsg = async()=>{
+  if(!activeGroupId||!currentUser)return;
+  const inp=document.getElementById('group-input');
+  const text=inp.value.trim();
+  if(!text)return;
+  inp.value='';
+  await addDoc(collection(db,'groupes',activeGroupId,'messages'),{
+    text,senderUid:currentUser.uid,senderName:currentUser.displayName,senderPrenom:currentUser.prenom,createdAt:serverTimestamp()
+  });
+  await updateDoc(doc(db,'groupes',activeGroupId),{lastMessage:`${currentUser.prenom}: ${text.substring(0,40)}`,lastMessageAt:serverTimestamp()});
+};
+
+// ══════════════ ÉMOJIS ══════════════
+const EMOJIS=['😀','😂','😍','🥰','😎','🤩','😊','👍','👏','🙏','❤️','🔥','💯','🎉','📚','✅','💪','🏆','🤔','😅','🫡','💬','🇨🇲','⚽','🎵'];
+window.toggleEmoji = targetId=>{
+  let p=document.getElementById('emoji-panel');
+  if(p){p.remove();return;}
+  p=document.createElement('div');
+  p.id='emoji-panel';p.className='emoji-panel';
+  EMOJIS.forEach(e=>{
+    const btn=document.createElement('button');
+    btn.className='emoji-btn';btn.textContent=e;
+    btn.onclick=()=>{const inp=document.getElementById(targetId);if(inp)inp.value+=e;p.remove();};
+    p.appendChild(btn);
+  });
+  document.querySelector('.chat-input-wrap,.group-input-wrap')?.appendChild(p);
+};
+
+// ══════════════ PROFIL ══════════════
+window.loadProfil = async()=>{
+  if(!currentUser)return;
+  const ini=currentUser.prenom?.[0]?.toUpperCase()||'?';
+  setText('profil-avatar-letter',ini);
+  setText('profil-name',currentUser.displayName||'—');
+  setText('profil-info',`${currentUser.classe||''} · ${currentUser.ville||''}`);
+  setText('profil-classe',`🎓 ${currentUser.classe||'—'}`);
+  setText('profil-ville',`📍 ${currentUser.ville||'—'}`);
+  setText('profil-email',`✉️ ${currentUser.email||'—'}`);
+  setText('profil-xp',String(currentUser.xp||0));
+  if(currentUser.photoURL) refreshPhotos(currentUser.photoURL);
+  try {
+    const snap=await getDocs(query(collection(db,'posts'),where('authorUid','==',currentUser.uid)));
+    setText('stat-posts',String(snap.size));
+  } catch(e){}
+};
+
+// ══════════════ NAVIGATION ══════════════
+window.showTab = tab=>{
+  document.querySelectorAll('.tab-screen').forEach(s=>s.classList.remove('tab-active'));
+  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.remove('active'));
+  const s=document.getElementById(`screen-${tab}`);
+  const b=document.getElementById(`nav-${tab}`);
+  if(s) s.classList.add('tab-active');
+  if(b) b.classList.add('active');
+  if(tab==='fil') loadFil();
+  if(tab==='cours') loadCours();
+  if(tab==='classement') loadClassement();
+  if(tab==='messages'){loadConversations();loadGroupes();}
+  if(tab==='profil') loadProfil();
+};
+
+window.showMsgTab = tab=>{
+  document.querySelectorAll('.msg-tab-content').forEach(s=>s.style.display='none');
+  document.querySelectorAll('.msg-tab').forEach(b=>b.classList.remove('active'));
+  const c=document.getElementById(`msgcontent-${tab}`);
+  const b=document.getElementById(`msgtab-${tab}`);
+  if(c) c.style.display='block';
+  if(b) b.classList.add('active');
+};
+
+window.showPanel  = id=>{ const p=document.getElementById(id); if(p){p.style.display='flex';} };
+window.closeChatPanel  = ()=>{ const p=document.getElementById('msgs-panel');  if(p)p.style.display='none'; if(unsubMsgs){unsubMsgs();unsubMsgs=null;} };
+window.closeGroupPanel = ()=>{ const p=document.getElementById('group-panel'); if(p)p.style.display='none'; if(unsubGroup){unsubGroup();unsubGroup=null;} };
+
+// ══════════════ UTILITAIRES ══════════════
+function v(id){const e=document.getElementById(id);return e?e.value.trim():'';}
+function esc(t){return(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');}
+function timeAgo(d){if(!d)return'À l\'instant';const s=Math.floor((Date.now()-d)/1000);if(s<60)return'À l\'instant';if(s<3600)return`${Math.floor(s/60)}min`;if(s<86400)return`${Math.floor(s/3600)}h`;return`${Math.floor(s/86400)}j`;}
+function fbErr(c){const e={'auth/email-already-in-use':'Email déjà utilisé.','auth/invalid-email':'Email invalide.','auth/weak-password':'Mot de passe trop faible.','auth/user-not-found':'Aucun compte avec cet email.','auth/wrong-password':'Mot de passe incorrect.','auth/invalid-credential':'Email ou mot de passe incorrect.','auth/too-many-requests':'Trop de tentatives.','auth/network-request-failed':'Pas de connexion.'};return e[c]||'Erreur.';}
+function setBtn(btn,on){btn.disabled=on;if(on)btn.dataset.origLabel=btn.textContent;else if(btn.dataset.origLabel)btn.textContent=btn.dataset.origLabel;}
+function showErr(m){toast(m,'error');}
+function showOk(m){toast(m,'success');}
+window.showErr=showErr;window.showOk=showOk;
+function toast(m,t){const e=document.getElementById('toast');e.textContent=m;e.className=`toast ${t} show`;setTimeout(()=>e.classList.remove('show'),4000);}
+window.showScreen=name=>{document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));const t=document.getElementById('screen-'+name);if(t)t.classList.add('active');};
+window.toggleAge=()=>{const age=parseInt(v('r-age'));document.getElementById('parent-block').style.display=(age>0&&age<18)?'block':'none';};
+
+document.getElementById('post-content')?.addEventListener('input',function(){setText('char-count',`${this.value.length}/1000`);});
+</script>
+
+<style>
+:root{--navy:#0A1628;--navy2:#111F3A;--card:#141F35;--gold:#D4A843;--gold2:#F0C96A;--white:#FAFAF8;--gray:#8A95A8;--error:#FF4D6D;--success:#2ECC71;--r:16px;}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden}
+body{background:var(--navy);color:var(--white);font-family:'DM Sans',sans-serif;display:flex;flex-direction:column}
+.screen{display:none;flex:1;flex-direction:column;overflow:hidden}
+.screen.active{display:flex}
+
+/* AUTH */
+.auth-wrap{flex:1;overflow-y:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px 20px}
+.logo-text{font-family:'Syne',sans-serif;font-size:2.2rem;font-weight:800;text-align:center}
+.logo-text span{color:var(--gold)}
+.logo-sub{font-size:.72rem;color:var(--gray);letter-spacing:1.8px;text-transform:uppercase;text-align:center;margin-top:4px;margin-bottom:28px}
+.card{background:var(--card);border:1px solid rgba(212,168,67,.15);border-radius:var(--r);padding:26px 22px;width:100%;max-width:420px}
+.card-title{font-family:'Syne',sans-serif;font-size:1.3rem;font-weight:700;margin-bottom:4px}
+.card-sub{font-size:.83rem;color:var(--gray);margin-bottom:22px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:.72rem;font-weight:500;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.field input,.field select{width:100%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:11px;padding:11px 13px;color:var(--white);font-family:'DM Sans',sans-serif;font-size:.92rem;outline:none;-webkit-appearance:none}
+.field input:focus,.field select:focus{border-color:var(--gold)}
+.field input::placeholder{color:rgba(255,255,255,.22)}
+.row-2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.btn-primary{width:100%;background:var(--gold);color:var(--navy);font-family:'Syne',sans-serif;font-weight:700;font-size:.92rem;padding:13px;border-radius:100px;border:none;cursor:pointer;margin-top:6px}
+.btn-primary:disabled{opacity:.6}
+.switch-link{text-align:center;margin-top:16px;font-size:.83rem;color:var(--gray)}
+.switch-link a{color:var(--gold);cursor:pointer;font-weight:500}
+#parent-block{display:none;background:rgba(212,168,67,.07);border:1px solid rgba(212,168,67,.22);border-radius:11px;padding:12px;margin-bottom:14px}
+#parent-block p{font-size:.76rem;color:var(--gold);margin-bottom:8px}
+
+/* DASHBOARD */
+#screen-dashboard{background:var(--navy)}
+.dash-header{background:var(--card);border-bottom:1px solid rgba(212,168,67,.15);padding:13px 18px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.dash-logo{font-family:'Syne',sans-serif;font-weight:800;font-size:1.25rem}
+.dash-logo span{color:var(--gold)}
+.header-right{display:flex;align-items:center;gap:12px}
+.notif-wrap{position:relative;cursor:pointer}
+.notif-badge{position:absolute;top:-4px;right:-4px;background:var(--error);color:#fff;font-size:.6rem;font-weight:700;width:16px;height:16px;border-radius:50%;display:none;align-items:center;justify-content:center}
+.logout-btn{background:none;border:none;color:var(--gray);cursor:pointer;font-size:.83rem;font-family:'DM Sans',sans-serif}
+
+/* TABS */
+.tab-content{flex:1;overflow:hidden;position:relative}
+.tab-screen{display:none;position:absolute;inset:0;overflow-y:auto;padding:14px 16px}
+.tab-screen.tab-active{display:block}
+.tab-nav{background:var(--card);border-top:1px solid rgba(255,255,255,.07);display:flex;flex-shrink:0;padding-bottom:env(safe-area-inset-bottom)}
+.nav-btn{flex:1;background:none;border:none;color:var(--gray);padding:10px 2px;font-size:.62rem;font-family:'DM Sans',sans-serif;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px}
+.nav-btn .ni{font-size:1.25rem}
+.nav-btn.active{color:var(--gold)}
+
+/* ACCUEIL */
+.welcome-banner{background:linear-gradient(135deg,var(--navy2),rgba(212,168,67,.12));border:1px solid rgba(212,168,67,.2);border-radius:var(--r);padding:18px;margin-bottom:14px}
+.welcome-banner h2{font-family:'Syne',sans-serif;font-size:1.15rem;margin-bottom:3px}
+.welcome-banner p{color:var(--gray);font-size:.82rem}
+.xp-bar{height:5px;background:rgba(255,255,255,.1);border-radius:100px;overflow:hidden;margin-top:10px}
+.xp-fill{height:100%;width:5%;background:linear-gradient(90deg,var(--gold),var(--gold2));border-radius:100px}
+.dash-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.dash-tile{background:var(--card);border:1px solid rgba(255,255,255,.07);border-radius:13px;padding:14px;cursor:pointer;transition:border-color .2s}
+.dash-tile:active{border-color:var(--gold)}
+.dash-tile .icon{font-size:1.5rem;margin-bottom:7px}
+.dash-tile .t{font-family:'Syne',sans-serif;font-size:.86rem;font-weight:700}
+.dash-tile .s{font-size:.72rem;color:var(--gray);margin-top:2px}
+.badge-soon{display:inline-block;background:rgba(212,168,67,.15);color:var(--gold);font-size:.6rem;font-weight:700;padding:2px 6px;border-radius:100px}
+
+/* FIL */
+.post-box{background:var(--card);border:1px solid rgba(212,168,67,.15);border-radius:var(--r);padding:14px;margin-bottom:14px}
+.post-box-top{display:flex;gap:10px;margin-bottom:10px}
+.post-avatar-sm{width:34px;height:34px;background:var(--gold);border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:700;color:var(--navy);font-size:.9rem;flex-shrink:0;overflow:hidden}
+.post-textarea{width:100%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:11px;padding:10px 12px;color:var(--white);font-family:'DM Sans',sans-serif;font-size:.88rem;resize:none;min-height:70px;outline:none}
+.post-textarea:focus{border-color:var(--gold)}
+.post-textarea::placeholder{color:rgba(255,255,255,.22)}
+.post-box-bottom{display:flex;align-items:center;gap:8px}
+.post-select{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:7px 9px;color:var(--white);font-family:'DM Sans',sans-serif;font-size:.8rem;outline:none;flex:1;-webkit-appearance:none}
+.char-count{font-size:.72rem;color:var(--gray);white-space:nowrap}
+.btn-publish{background:var(--gold);color:var(--navy);font-family:'Syne',sans-serif;font-weight:700;font-size:.82rem;padding:8px 16px;border-radius:100px;border:none;cursor:pointer;white-space:nowrap}
+.post-card{background:var(--card);border:1px solid rgba(255,255,255,.07);border-radius:var(--r);padding:14px;margin-bottom:10px}
+.post-header{display:flex;align-items:flex-start;gap:9px;margin-bottom:9px}
+.post-avatar{width:36px;height:36px;background:linear-gradient(135deg,var(--gold),var(--gold2));border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:700;color:var(--navy);font-size:.95rem;flex-shrink:0;overflow:hidden}
+.post-meta{flex:1}
+.post-author{font-family:'Syne',sans-serif;font-size:.88rem;font-weight:700}
+.post-info{font-size:.72rem;color:var(--gray);margin-top:2px}
+.post-cat{font-size:.68rem;font-weight:600;padding:3px 7px;border-radius:100px;white-space:nowrap}
+.post-content{font-size:.88rem;line-height:1.55;margin-bottom:10px;white-space:pre-wrap;word-break:break-word}
+.post-actions{display:flex;gap:10px;flex-wrap:wrap}
+.action-btn{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:100px;padding:5px 12px;color:var(--white);font-size:.78rem;cursor:pointer;font-family:'DM Sans',sans-serif}
+.action-btn.liked{background:rgba(212,168,67,.15);border-color:var(--gold);color:var(--gold)}
+.comments-section{margin-top:10px;border-top:1px solid rgba(255,255,255,.07);padding-top:10px}
+.comment-item{display:flex;gap:7px;margin-bottom:8px}
+.comment-avatar{width:26px;height:26px;background:var(--navy2);border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:700;color:var(--gold);font-size:.72rem;flex-shrink:0}
+.comment-author{font-size:.75rem;font-weight:600;color:var(--gold)}
+.comment-text{font-size:.8rem;margin-top:2px;line-height:1.4}
+.comment-form{display:flex;gap:7px;margin-top:8px}
+.comment-form input{flex:1;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:100px;padding:7px 13px;color:var(--white);font-family:'DM Sans',sans-serif;font-size:.8rem;outline:none}
+.comment-form input:focus{border-color:var(--gold)}
+.comment-form button{background:var(--gold);color:var(--navy);font-family:'Syne',sans-serif;font-weight:700;font-size:.76rem;padding:7px 13px;border-radius:100px;border:none;cursor:pointer}
+
+/* COURS */
+.cours-card{background:var(--card);border:1px solid rgba(255,255,255,.07);border-radius:13px;padding:14px;margin-bottom:10px}
+.cours-header{display:flex;align-items:center;gap:9px;margin-bottom:7px}
+.cours-icon{width:40px;height:40px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:1.2rem;flex-shrink:0}
+.cours-meta{flex:1;min-width:0}
+.cours-titre{font-family:'Syne',sans-serif;font-size:.9rem;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cours-info{font-size:.72rem;color:var(--gray);margin-top:2px;text-transform:capitalize}
+.cours-size{font-size:.7rem;color:var(--gray);white-space:nowrap}
+.cours-desc{font-size:.8rem;color:var(--gray);margin-bottom:9px;line-height:1.5}
+.cours-actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.btn-dl{background:var(--gold);color:var(--navy);font-family:'Syne',sans-serif;font-weight:700;font-size:.78rem;padding:6px 13px;border-radius:100px;text-decoration:none;display:inline-block}
+.cours-form-wrap{background:var(--card);border:1px solid rgba(212,168,67,.2);border-radius:var(--r);padding:14px;margin-bottom:14px}
+.cours-form-wrap .field{margin-bottom:11px}
+.cours-form-wrap label{display:block;font-size:.72rem;color:var(--gray);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
+.cours-form-wrap input,.cours-form-wrap select,.cours-form-wrap textarea{width:100%;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:9px 11px;color:var(--white);font-family:'DM Sans',sans-serif;font-size:.86rem;outline:none;-webkit-appearance:none}
+.cours-form-wrap input:focus,.cours-form-wrap select:focus,.cours-form-wrap textarea:focus{border-color:var(--gold)}
+.cours-filters{display:flex;gap:7px;margin-bottom:12px;overflow-x:auto;padding-bottom:3px}
+.cours-filter{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:100px;padding:5px 12px;color:var(--gray);font-size:.76rem;cursor:pointer;white-space:nowrap;font-family:'DM Sans',sans-serif}
+.cours-filter.active{background:rgba(212,168,67,.15);border-color:var(--gold);color:var(--gold)}
+.file-upload-area{background:rgba(255,255,255,.03);border:2px dashed rgba(212,168,67,.3);border-radius:11px;padding:14px;text-align:center;cursor:pointer}
+.file-upload-area:active{border-color:var(--gold)}
+.file-name{font-size:.75rem;color:var(--gray);margin-top:5px}
+
+/* CLASSEMENT */
+.rank-item{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid rgba(255,255,255,.07);border-radius:13px;padding:12px;margin-bottom:8px}
+.rank-item.rank-me{border-color:var(--gold);background:rgba(212,168,67,.08)}
+.rank-pos{font-size:1.3rem;width:30px;text-align:center;flex-shrink:0}
+.rank-avatar{width:36px;height:36px;background:linear-gradient(135deg,var(--gold),var(--gold2));border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:700;color:var(--navy);font-size:.95rem;flex-shrink:0}
+.rank-info{flex:1}
+.rank-name{font-family:'Syne',sans-serif;font-size:.88rem;font-weight:700}
+.rank-sub{font-size:.72rem;color:var(--gray);margin-top:2px}
+.rank-xp{text-align:center}
+.rank-xp-num{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;color:var(--gold)}
+
+/* MESSAGES */
+.msg-tabs{display:flex;gap:0;margin-bottom:14px;background:var(--card);border-radius:100px;padding:4px}
+.msg-tab{flex:1;background:none;border:none;color:var(--gray);padding:9px 6px;font-size:.8rem;font-family:'DM Sans',sans-serif;cursor:pointer;border-radius:100px;transition:all .2s}
+.msg-tab.active{background:var(--gold);color:var(--navy);font-weight:700}
+.conv-item{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid rgba(255,255,255,.07);border-radius:13px;padding:12px;margin-bottom:8px;cursor:pointer}
+.conv-item:active{border-color:var(--gold)}
+.conv-avatar{width:40px;height:40px;background:linear-gradient(135deg,var(--gold),var(--gold2));border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:700;color:var(--navy);font-size:1rem;flex-shrink:0}
+.conv-info{flex:1;min-width:0}
+.conv-name{font-family:'Syne',sans-serif;font-size:.88rem;font-weight:700}
+.conv-last{font-size:.75rem;color:var(--gray);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.groupe-badge{background:var(--gold);color:var(--navy);font-family:'Syne',sans-serif;font-weight:700;font-size:.7rem;padding:3px 8px;border-radius:100px;flex-shrink:0}
+
+/* CHAT PANEL */
+.chat-panel{display:none;position:fixed;inset:0;background:var(--navy);z-index:200;flex-direction:column}
+.chat-header{background:var(--card);border-bottom:1px solid rgba(212,168,67,.15);padding:13px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.chat-back{background:none;border:none;color:var(--gold);font-size:1.3rem;cursor:pointer;padding:4px}
+.chat-av{width:34px;height:34px;background:var(--gold);border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:'Syne',sans-serif;font-weight:700;color:var(--navy);font-size:.9rem}
+.chat-name{font-family:'Syne',sans-serif;font-weight:700;font-size:.95rem;flex:1}
+.msgs-box{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:7px}
+.msg-bubble{max-width:75%;padding:9px 13px;border-radius:17px;font-size:.86rem;line-height:1.45;word-break:break-word}
+.msg-mine{background:var(--gold);color:var(--navy);align-self:flex-end;border-bottom-right-radius:4px;font-weight:500}
+.msg-other{background:var(--card);color:var(--white);align-self:flex-start;border-bottom-left-radius:4px;border:1px solid rgba(255,255,255,.08)}
+.msg-sender{font-size:.7rem;color:var(--gold);margin-bottom:3px;font-weight:600}
+.chat-input-wrap,.group-input-wrap{background:var(--card);border-top:1px solid rgba(255,255,255,.08);padding:11px 14px;display:flex;gap:7px;align-items:center;flex-shrink:0;position:relative}
+.chat-input{flex:1;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:100px;padding:9px 14px;color:var(--white);font-family:'DM Sans',sans-serif;font-size:.86rem;outline:none}
+.chat-input:focus{border-color:var(--gold)}
+.chat-send{background:var(--gold);color:var(--navy);border:none;border-radius:50%;width:36px;height:36px;font-size:1rem;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.chat-emoji-btn{background:none;border:none;font-size:1.2rem;cursor:pointer;padding:3px}
+.emoji-panel{position:absolute;bottom:56px;left:14px;background:var(--card);border:1px solid rgba(212,168,67,.2);border-radius:13px;padding:8px;display:flex;flex-wrap:wrap;gap:3px;max-width:260px;z-index:300}
+.emoji-btn{background:none;border:none;font-size:1.3rem;cursor:pointer;padding:3px;border-radius:7px}
+
+/* PROFIL */
+.profil-stats{display:flex;justify-content:space-around;background:var(--card);border-radius:var(--r);padding:18px;border:1px solid rgba(255,255,255,.07);margin:16px 0 12px}
+.profil-info-block{background:var(--card);border-radius:var(--r);padding:14px;border:1px solid rgba(255,255,255,.07);text-align:left}
+.profil-info-row{font-size:.86rem;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.profil-info-row:last-child{border-bottom:none}
+
+/* TOAST */
+.toast{position:fixed;bottom:75px;left:50%;transform:translateX(-50%) translateY(100px);background:var(--card);border-radius:100px;padding:10px 20px;font-size:.83rem;z-index:9999;transition:transform .3s;max-width:90vw;text-align:center;border:1px solid rgba(255,255,255,.1)}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.toast.error{border-color:var(--error);color:var(--error)}
+.toast.success{border-color:var(--success);color:var(--success)}
+.empty-state{text-align:center;padding:36px 16px;color:var(--gray)}
+.empty-state p{font-size:.88rem;line-height:1.6;margin-top:10px}
+.section-title{font-family:'Syne',sans-serif;font-weight:700;font-size:.95rem;margin-bottom:12px}
+</style>
+</head>
+<body>
+<div id="toast" class="toast"></div>
+
+<!-- ══ LOGIN ══ -->
+<div id="screen-login" class="screen active">
+  <div class="auth-wrap">
+    <div class="logo-text">Edu<span>Link</span></div>
+    <div class="logo-sub">Apprends · Partage · Évolue</div>
+    <div class="card">
+      <div class="card-title">Bon retour 👋</div>
+      <div class="card-sub">Connecte-toi à ton espace scolaire</div>
+      <form onsubmit="handleLogin(event)">
+        <div class="field"><label>Email</label><input id="l-email" type="email" placeholder="ton.email@exemple.com" required autocomplete="email"></div>
+        <div class="field"><label>Mot de passe</label><input id="l-password" type="password" placeholder="••••••••" required></div>
+        <button id="btn-login" class="btn-primary" type="submit">Se connecter</button>
+      </form>
+      <div class="switch-link">Pas de compte ? <a onclick="showScreen('register')">S'inscrire</a></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ REGISTER ══ -->
+<div id="screen-register" class="screen">
+  <div class="auth-wrap">
+    <div class="logo-text">Edu<span>Link</span></div>
+    <div class="logo-sub">Inscription gratuite</div>
+    <div class="card">
+      <div class="card-title">Rejoindre EduLink 🎓</div>
+      <div class="card-sub">Ouverte à tous les élèves</div>
+      <form onsubmit="handleRegister(event)">
+        <div class="row-2">
+          <div class="field"><label>Prénom</label><input id="r-prenom" type="text" placeholder="Jean" required></div>
+          <div class="field"><label>Nom</label><input id="r-nom" type="text" placeholder="Dupont" required></div>
+        </div>
+        <div class="field"><label>Email</label><input id="r-email" type="email" placeholder="ton.email@exemple.com" required></div>
+        <div class="row-2">
+          <div class="field"><label>Classe</label>
+            <select id="r-classe" required>
+              <option value="">Choisir</option>
+              <optgroup label="Collège"><option value="6e">6ème</option><option value="5e">5ème</option><option value="4e">4ème</option><option value="3e">3ème</option></optgroup>
+              <optgroup label="Lycée"><option value="2nde">2nde</option><option value="1ere">1ère</option><option value="Tle">Terminale</option></optgroup>
+              <optgroup label="Supérieur"><option value="L1">L1</option><option value="L2">L2</option><option value="L3">L3</option><option value="M1">M1</option><option value="M2">M2</option></optgroup>
+            </select>
+          </div>
+          <div class="field"><label>Âge</label><input id="r-age" type="number" placeholder="16" min="13" max="30" required oninput="toggleAge()"></div>
+        </div>
+        <div class="field"><label>Ville</label><input id="r-ville" type="text" placeholder="Yaoundé, Douala..." required></div>
+        <div id="parent-block"><p>⚠️ Moins de 18 ans — email parent requis</p><div class="field" style="margin-bottom:0"><label>Email parent</label><input id="r-parent-email" type="email" placeholder="parent@exemple.com"></div></div>
+        <div class="field"><label>Mot de passe</label><input id="r-password" type="password" placeholder="8 caractères minimum" required minlength="8"></div>
+        <div class="field"><label>Confirmer</label><input id="r-confirm" type="password" placeholder="••••••••" required></div>
+        <button id="btn-register" class="btn-primary" type="submit">Créer mon compte</button>
+      </form>
+      <div class="switch-link">Déjà un compte ? <a onclick="showScreen('login')">Se connecter</a></div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ DASHBOARD ══ -->
+<div id="screen-dashboard" class="screen">
+  <div class="dash-header">
+    <div class="dash-logo">Edu<span>Link</span></div>
+    <div class="header-right">
+      <div class="notif-wrap" onclick="showTab('messages')">
+        🔔<div class="notif-badge" id="notif-count">0</div>
+      </div>
+      <button class="logout-btn" onclick="handleLogout()">Déco</button>
+    </div>
+  </div>
+
+  <div class="tab-content">
+
+    <!-- ACCUEIL -->
+    <div id="screen-accueil" class="tab-screen tab-active">
+      <div class="welcome-banner">
+        <h2 id="dash-name">Bonjour 👋</h2>
+        <p id="dash-info"></p>
+        <div style="display:flex;justify-content:space-between;margin-top:10px;font-size:.73rem;color:var(--gray)"><span>🏆 XP : <span id="xp-val">0</span></span><span>Niveau 1</span></div>
+        <div class="xp-bar"><div class="xp-fill"></div></div>
+      </div>
+      <div class="dash-grid">
+        <div class="dash-tile" onclick="showTab('fil')"><div class="icon">📰</div><div class="t">Fil scolaire</div><div class="s">Posts & annonces</div></div>
+        <div class="dash-tile" onclick="showTab('cours')"><div class="icon">📚</div><div class="t">Cours</div><div class="s">Ressources PDF</div></div>
+        <div class="dash-tile" onclick="showTab('classement')"><div class="icon">🏅</div><div class="t">Classement</div><div class="s">Top élèves XP</div></div>
+        <div class="dash-tile" onclick="showTab('messages')"><div class="icon">💬</div><div class="t">Messages</div><div class="s">Privés & groupes</div></div>
+        <div class="dash-tile" onclick="showTab('profil');loadProfil()"><div class="icon">👤</div><div class="t">Mon profil</div><div class="s">Photo & stats</div></div>
+        <div class="dash-tile" onclick="showSuccess('Bientôt : Forum, Orange Money ! 🚀')"><div class="icon">⚡</div><div class="t">Bientôt</div><div class="s">Forum & Premium</div></div>
+      </div>
+    </div>
+
+    <!-- FIL -->
+    <div id="screen-fil" class="tab-screen">
+      <div class="post-box">
+        <div class="post-box-top">
+          <div class="post-avatar-sm"><img id="post-avatar-img" style="width:34px;height:34px;border-radius:50%;object-fit:cover;display:none"><span id="post-avatar-letter">?</span></div>
+          <textarea id="post-content" class="post-textarea" placeholder="Quoi de neuf ? Partage avec la communauté..." maxlength="1000"></textarea>
+        </div>
+        <div class="post-box-bottom">
+          <select id="post-categorie" class="post-select">
+            <option value="general">💬 Général</option>
+            <option value="cours">📚 Cours</option>
+            <option value="question">❓ Question</option>
+            <option value="annonce">📢 Annonce</option>
+            <option value="detente">😄 Détente</option>
+          </select>
+          <span class="char-count" id="char-count">0/1000</span>
+          <button id="btn-publish" class="btn-publish" onclick="handlePost(event)">Publier</button>
+        </div>
+      </div>
+      <div id="posts-container"><div class="empty-state"><p>⏳ Chargement...</p></div></div>
+    </div>
+
+    <!-- COURS -->
+    <div id="screen-cours" class="tab-screen">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+        <div class="section-title">📚 Cours partagés</div>
+        <button onclick="toggleCoursForm()" style="background:var(--gold);color:var(--navy);font-family:'Syne',sans-serif;font-weight:700;font-size:.78rem;padding:7px 14px;border-radius:100px;border:none;cursor:pointer">+ Partager</button>
+      </div>
+      <div id="cours-form" class="cours-form-wrap" style="display:none">
+        <div style="font-family:'Syne',sans-serif;font-weight:700;margin-bottom:12px">📤 Partager un cours</div>
+        <div class="field"><label>Titre *</label><input id="cours-titre" type="text" placeholder="Ex: Cours de maths — Fonctions"></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:9px">
+          <div class="field"><label>Matière *</label>
+            <select id="cours-matiere">
+              <option value="">Choisir</option>
+              <option value="maths">📐 Maths</option><option value="francais">📖 Français</option>
+              <option value="anglais">🌍 Anglais</option><option value="physique">⚗️ Physique</option>
+              <option value="svt">🌿 SVT</option><option value="histoire">🏛️ Histoire</option>
+              <option value="info">💻 Info</option><option value="autre">📝 Autre</option>
+            </select>
+          </div>
+          <div class="field"><label>Classe *</label>
+            <select id="cours-classe">
+              <option value="">Choisir</option>
+              <option value="6e">6ème</option><option value="5e">5ème</option><option value="4e">4ème</option>
+              <option value="3e">3ème</option><option value="2nde">2nde</option><option value="1ere">1ère</option>
+              <option value="Tle">Terminale</option><option value="L1">L1</option><option value="L2">L2</option>
+              <option value="L3">L3</option><option value="tous">Toutes</option>
+            </select>
+          </div>
+        </div>
+        <div class="field"><label>Description</label><textarea id="cours-desc" placeholder="Résumé du cours..." rows="2" style="resize:none"></textarea></div>
+        <div class="field">
+          <label>Fichier (PDF ou image) *</label>
+          <div class="file-upload-area" onclick="document.getElementById('cours-file').click()">
+            <div style="font-size:1.8rem">📎</div>
+            <div style="font-size:.82rem;color:var(--gray);margin-top:3px">Clique pour sélectionner</div>
+            <div style="font-size:.7rem;color:var(--gray)">PDF, JPG, PNG · Max 10MB</div>
+            <input id="cours-file" type="file" accept=".pdf,image/*" style="display:none" onchange="updateFileName(this)">
+          </div>
+          <div class="file-name" id="file-name-display">Aucun fichier</div>
+        </div>
+        <button id="btn-upload-cours" onclick="uploadCours()" style="width:100%;background:var(--gold);color:var(--navy);font-family:'Syne',sans-serif;font-weight:700;padding:12px;border-radius:100px;border:none;cursor:pointer">📤 Publier le cours</button>
+      </div>
+      <div class="cours-filters">
+        <button class="cours-filter active" onclick="filterCours(this,'','')">Tous</button>
+        <button class="cours-filter" onclick="filterCours(this,'maths','')">📐 Maths</button>
+        <button class="cours-filter" onclick="filterCours(this,'francais','')">📖 Français</button>
+        <button class="cours-filter" onclick="filterCours(this,'anglais','')">🌍 Anglais</button>
+        <button class="cours-filter" onclick="filterCours(this,'physique','')">⚗️ Physique</button>
+        <button class="cours-filter" onclick="filterCours(this,'svt','')">🌿 SVT</button>
+        <button class="cours-filter" onclick="filterCours(this,'info','')">💻 Info</button>
+      </div>
+      <div id="cours-container"><div class="empty-state"><p>⏳ Chargement...</p></div></div>
+    </div>
+
+    <!-- CLASSEMENT -->
+    <div id="screen-classement" class="tab-screen">
+      <div class="section-title">🏆 Classement XP — Top 20</div>
+      <div style="background:rgba(212,168,67,.08);border:1px solid rgba(212,168,67,.2);border-radius:12px;padding:12px;margin-bottom:14px;font-size:.8rem;color:var(--gray);line-height:1.5">
+        💡 Gagne des XP en publiant des posts (+5), commentant (+2), likant (+1) et partageant des cours (+10) !
+      </div>
+      <div id="classement-container"><div class="empty-state"><p>⏳ Chargement...</p></div></div>
+    </div>
+
+    <!-- MESSAGES -->
+    <div id="screen-messages" class="tab-screen">
+      <div class="msg-tabs">
+        <button class="msg-tab active" id="msgtab-prive" onclick="showMsgTab('prive')">💬 Privés</button>
+        <button class="msg-tab" id="msgtab-groupe" onclick="showMsgTab('groupe');loadGroupes()">👥 Ma classe</button>
+      </div>
+      <div id="msgcontent-prive" class="msg-tab-content" style="display:block">
+        <div id="convs-list"><div class="empty-state"><div style="font-size:2.5rem">💬</div><p>Aucune conversation.<br>Clique ✉️ MP dans le fil !</p></div></div>
+      </div>
+      <div id="msgcontent-groupe" class="msg-tab-content" style="display:none">
+        <div id="groupes-list"><div class="empty-state"><p>⏳ Chargement...</p></div></div>
+      </div>
+    </div>
+
+    <!-- PROFIL -->
+    <div id="screen-profil" class="tab-screen">
+      <div style="text-align:center;padding:20px 0 12px">
+        <div style="position:relative;width:84px;height:84px;margin:0 auto 14px">
+          <div style="width:84px;height:84px;background:linear-gradient(135deg,var(--gold),var(--gold2));border-radius:50%;display:flex;align-items:center;justify-content:center;overflow:hidden;border:3px solid rgba(212,168,67,.4)">
+            <img id="profil-photo-img" style="width:100%;height:100%;object-fit:cover;display:none">
+            <span id="profil-avatar-letter" style="font-family:'Syne',sans-serif;font-weight:800;font-size:2rem;color:var(--navy)">?</span>
+          </div>
+          <label style="position:absolute;bottom:0;right:0;width:26px;height:26px;background:var(--gold);border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:.8rem;border:2px solid var(--navy)">
+            ✏️<input type="file" accept="image/jpeg,image/png,image/webp" style="display:none" onchange="uploadAvatar(this.files[0])">
+          </label>
+        </div>
+        <div style="font-family:'Syne',sans-serif;font-size:1.2rem;font-weight:700" id="profil-name">—</div>
+        <div style="color:var(--gray);font-size:.82rem;margin-top:3px" id="profil-info">—</div>
+      </div>
+      <div class="profil-stats">
+        <div style="text-align:center"><div id="stat-posts" style="font-family:'Syne',sans-serif;font-size:1.4rem;font-weight:700;color:var(--gold)">0</div><div style="font-size:.72rem;color:var(--gray)">Posts</div></div>
+        <div style="text-align:center"><div id="profil-xp" style="font-family:'Syne',sans-serif;font-size:1.4rem;font-weight:700;color:var(--gold)">0</div><div style="font-size:.72rem;color:var(--gray)">XP</div></div>
+        <div style="text-align:center"><div style="font-family:'Syne',sans-serif;font-size:1.4rem;font-weight:700;color:var(--gold)">1</div><div style="font-size:.72rem;color:var(--gray)">Niveau</div></div>
+      </div>
+      <div class="profil-info-block">
+        <div style="font-size:.72rem;color:var(--gray);margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px">Informations</div>
+        <div class="profil-info-row" id="profil-classe">🎓 Classe : —</div>
+        <div class="profil-info-row" id="profil-ville">📍 Ville : —</div>
+        <div class="profil-info-row" id="profil-email">✉️ Email : —</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- NAV -->
+  <div class="tab-nav">
+    <button class="nav-btn active" id="nav-accueil" onclick="showTab('accueil')"><span class="ni">🏠</span>Accueil</button>
+    <button class="nav-btn" id="nav-fil" onclick="showTab('fil')"><span class="ni">📰</span>Fil</button>
+    <button class="nav-btn" id="nav-cours" onclick="showTab('cours')"><span class="ni">📚</span>Cours</button>
+    <button class="nav-btn" id="nav-classement" onclick="showTab('classement')"><span class="ni">🏅</span>Top</button>
+    <button class="nav-btn" id="nav-messages" onclick="showTab('messages')"><span class="ni">💬</span>Messages</button>
+    <button class="nav-btn" id="nav-profil" onclick="showTab('profil');loadProfil()"><span class="ni">👤</span>Profil</button>
+  </div>
+
+  <!-- CHAT PRIVÉ -->
+  <div id="msgs-panel" class="chat-panel">
+    <div class="chat-header">
+      <button class="chat-back" onclick="closeChatPanel()">←</button>
+      <div class="chat-av" id="chat-avatar">?</div>
+      <div class="chat-name" id="chat-title">Message</div>
+    </div>
+    <div class="msgs-box" id="msgs-container"></div>
+    <div class="chat-input-wrap">
+      <button class="chat-emoji-btn" onclick="toggleEmoji('dm-input')">😊</button>
+      <input id="dm-input" class="chat-input" type="text" placeholder="Message..." onkeydown="if(event.key==='Enter')sendDM()">
+      <button class="chat-send" onclick="sendDM()">➤</button>
+    </div>
+  </div>
+
+  <!-- CHAT GROUPE -->
+  <div id="group-panel" class="chat-panel">
+    <div class="chat-header">
+      <button class="chat-back" onclick="closeGroupPanel()">←</button>
+      <div class="chat-av" id="group-avatar" style="background:linear-gradient(135deg,#3498db,#2ecc71)">📚</div>
+      <div class="chat-name" id="group-title">Groupe</div>
+    </div>
+    <div class="msgs-box" id="group-msgs"></div>
+    <div class="group-input-wrap">
+      <button class="chat-emoji-btn" onclick="toggleEmoji('group-input')">😊</button>
+      <input id="group-input" class="chat-input" type="text" placeholder="Message au groupe..." onkeydown="if(event.key==='Enter')sendGroupMsg()">
+      <button class="chat-send" onclick="sendGroupMsg()">➤</button>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
